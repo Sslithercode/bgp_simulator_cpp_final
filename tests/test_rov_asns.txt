@@ -1,0 +1,6 @@
+# Test ROV ASNs
+# These ASes will deploy ROV and drop rov_invalid announcements
+
+1
+3
+4

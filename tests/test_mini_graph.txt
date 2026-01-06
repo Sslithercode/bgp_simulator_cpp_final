@@ -1,0 +1,13 @@
+# Mini test graph for Task 2.4
+# Simple hierarchy:
+# AS1 (Tier 1) -> AS2 (Provider) -> AS3 (Customer)
+# AS1 <-> AS4 (Peers)
+# AS2 -> AS5 (Customer)
+
+# Provider-Customer relationships (AS1 is provider of AS2)
+1|2|-1|test
+2|3|-1|test
+2|5|-1|test
+
+# Peer relationships
+1|4|0|test

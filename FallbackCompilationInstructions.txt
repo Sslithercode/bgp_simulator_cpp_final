@@ -1,0 +1,9 @@
+IF the bindings dont work by venv and pip install . 
+
+-> Then  Please do the following 
+
+-- if build is removed use mkdir build 
+-- cd build 
+-- cmake ..
+-- make 
+-- that should give you the needed files
