@@ -1,0 +1,575 @@
+================================================================================
+BGP SIMULATOR - DESIGN DECISIONS
+================================================================================
+
+This document outlines the key architectural and implementation decisions made
+in the BGP simulator project, along with rationale and trade-offs.
+
+================================================================================
+1. ARCHITECTURE OVERVIEW
+================================================================================
+
+The simulator is designed as a discrete-event BGP propagation system that
+operates on real-world AS topology data from CAIDA. The architecture consists
+of three main layers:
+
+1. Data Layer: Prefix representation, AS path storage, announcements
+2. Policy Layer: BGP routing policies (standard BGP and ROV)
+3. Graph Layer: AS topology with relationship-aware propagation
+
+================================================================================
+2. DATA STRUCTURE DECISIONS
+================================================================================
+
+2.1 PREFIX REPRESENTATION
+-------------------------
+Decision: Union-based IPv4/IPv6 prefix with discriminator flag
+File: include/announcement.h (lines 20-83)
+
+Rationale:
+- Memory efficiency: Union saves space compared to separate fields
+- IPv4Prefix: 8 bytes (4 bytes address + 1 byte length + 3 padding)
+- IPv6Prefix: 17 bytes (8+8 bytes address + 1 byte length)
+- Union adds 1 bool flag for type discrimination
+
+Trade-offs:
++ 50% memory savings vs storing both v4 and v6 fields
++ Fast access without vtable overhead
+- Requires manual type tracking via is_ipv6 flag
+- No automatic cleanup (acceptable since types are POD)
+
+Alternative considered: Inheritance with virtual functions
+Rejected because: Virtual function overhead (~8 bytes vtable pointer per object)
+would negate memory savings and add indirection cost.
+
+2.2 AS PATH STORAGE
+-------------------
+Decision: std::vector<ASN> for AS path in announcements
+File: include/announcement.h (line 125)
+
+Rationale:
+- Most AS paths are short (median ~4 hops, mean ~5-6 hops)
+- Vector provides cache-friendly sequential access
+- Efficient for prepending (via insert at begin when storing)
+- Small vector optimization in std library helps single-hop paths
+
+Trade-offs:
++ Excellent cache locality for path traversal
++ Simple containsAS() implementation for loop detection
+- O(n) prepend operation, but n is small in practice
+- Some memory overhead for capacity vs size
+
+Alternative considered: std::deque for O(1) prepend
+Rejected because: Cache locality loss outweighs prepend benefit for small n.
+
+2.3 AS GRAPH STORAGE
+--------------------
+Decision: std::unordered_map<ASN, ASNode> with reference_wrapper neighbors
+File: include/as_graph.h (lines 34-60, 66)
+
+Rationale:
+- ASN space is sparse (78k active out of 4 billion possible)
+- Hash map provides O(1) lookup by ASN
+- Reference wrappers to neighbors eliminate hash lookups during propagation
+- Pre-reserved capacity (120k) prevents rehashing and reference invalidation
+
+Key optimization:
+ASNode stores std::vector<std::reference_wrapper<ASNode>> instead of
+std::vector<ASN> for providers/customers/peers. This means:
+- During propagation: Direct neighbor access (no hash lookup)
+- Estimated speedup: ~30% in propagation phase
+
+Trade-offs:
++ O(1) ASN lookup vs O(log n) for map
++ Direct neighbor access saves millions of hash lookups
++ Handles sparse ASN space efficiently
+- Must pre-reserve capacity to prevent reference invalidation
+- ~24 bytes overhead per entry vs dense vector
+
+2.4 ROUTING INFORMATION BASE (RIB)
+-----------------------------------
+Decision: std::unordered_map<Prefix, Announcement> for local RIB
+File: include/bgp_policy.h (line 13)
+
+Rationale:
+- Need fast lookup by prefix during route selection
+- Typical RIB size: 1-100 prefixes per AS
+- Hash map optimal for this scale
+
+Trade-offs:
++ O(1) prefix lookup
++ Easy update/replacement of routes
+- Hash overhead acceptable for small maps
+
+================================================================================
+3. BGP POLICY DECISIONS
+================================================================================
+
+3.1 ROUTE SELECTION CRITERIA
+-----------------------------
+Decision: Three-tier selection process
+File: include/announcement.h (lines 166-179)
+
+Implementation:
+1. Relationship preference: ORIGIN > CUSTOMER > PEER > PROVIDER
+2. Shortest AS path length
+3. Lowest next-hop ASN (tie breaker)
+
+Rationale:
+- Models real-world BGP local preference
+- Valley-free routing naturally emerges from relationship preference
+- Deterministic tie-breaking ensures reproducible results
+
+Note: Simplified compared to full BGP (no MED, IGP cost, etc.) but
+captures essential economic routing behavior.
+
+3.2 VALLEY-FREE ROUTING ENFORCEMENT
+------------------------------------
+Decision: Filter exports based on received_from relationship
+File: src/as_graph.cpp (lines 371-375, 417-421)
+
+Rules implemented:
+- To providers: Only forward routes from customers or origin
+- To peers: Only forward routes from customers or origin
+- To customers: Forward all routes
+
+Rationale:
+- Prevents ASes from becoming transit for providers/peers
+- Models economic incentives in BGP
+- Critical for realistic route propagation
+
+Implementation approach:
+Check received_from field before forwarding. This is more efficient than
+re-deriving relationship from sender identity.
+
+3.3 AS PATH PREPENDING
+-----------------------
+Decision: Prepend ASN during processReceivedQueue(), not during forwarding
+File: src/bgp_policy.cpp (line 47)
+
+Flow:
+1. Sender creates announcement with copy_with_new_hop() (path unchanged)
+2. Receiver processes queue and prepends its own ASN before storing
+
+Rationale:
+- Separates announcement creation from path modification
+- Receiver controls its own path entry
+- Reduces copy operations (path copied once, not per neighbor)
+
+Alternative considered: Prepend at send time
+Rejected because: Would require one copy per recipient rather than one copy
+per sender, multiplying memory operations.
+
+================================================================================
+4. PROPAGATION ALGORITHM DECISIONS
+================================================================================
+
+4.1 THREE-PHASE PROPAGATION
+----------------------------
+Decision: Separate UP, ACROSS, DOWN phases
+File: src/as_graph.cpp (lines 328-349)
+
+Phase sequence:
+1. UP: Rank 0 → highest rank (providers)
+2. ACROSS: All ranks simultaneously (peers)
+3. DOWN: Highest rank → 0 (customers)
+
+Rationale:
+- Models BGP import/export filtering naturally
+- Prevents peer routes from traversing multiple peer links
+- Rank-based ordering ensures proper dependency resolution
+
+Why this matters:
+- UP phase: Lower-tier ASes announce first, tiers process in sequence
+- ACROSS phase: Process all peers simultaneously to prevent multi-hop peer paths
+- DOWN phase: Top-tier ASes distribute routes downward
+
+Alternative considered: Single unified propagation pass
+Rejected because: Cannot properly enforce valley-free routing and single-hop
+peer propagation constraints.
+
+4.2 GRAPH FLATTENING (RANKING)
+-------------------------------
+Decision: BFS-based rank assignment with customer-count tracking
+File: src/as_graph.cpp (lines 248-325)
+
+Algorithm:
+1. ASes with no customers start at rank 0
+2. AS rank = MAX(all customer ranks) + 1
+3. Process in topological order using customer count
+
+Rationale:
+- Ensures all customers processed before providers
+- Enables efficient rank-by-rank propagation
+- Handles complex provider relationships correctly
+
+Complexity: O(V + E) where V = ASes, E = relationships
+
+Example hierarchy:
+Rank 0: Stub networks (65,999 ASes - 84% of total)
+Rank 1: Small providers (7,533 ASes)
+Rank 2: Regional providers (2,216 ASes)
+...
+Rank 75: Tier-1 ISPs (2 ASes)
+
+4.3 LOOP PREVENTION
+-------------------
+Decision: Check AS path before forwarding
+File: src/as_graph.cpp (lines 381, 428, 470)
+
+Implementation:
+Before forwarding to neighbor N, check if N is in AS path using containsAS().
+If found, skip forwarding to that neighbor.
+
+Complexity: O(path_length) per neighbor
+Typical cost: 4-6 comparisons per check
+
+Alternative considered: Maintain visited set per prefix
+Rejected because: Memory overhead (78k × num_prefixes) exceeds CPU cost of
+linear search through short paths.
+
+================================================================================
+5. ROV (ROUTE ORIGIN VALIDATION) DECISIONS
+================================================================================
+
+5.1 ROV POLICY IMPLEMENTATION
+------------------------------
+Decision: ROV as subclass of BGP with receive-time filtering
+File: src/bgp_policy.cpp (lines 68-78)
+
+Implementation:
+- ROV extends BGP class
+- Overrides receiveAnnouncement() to filter invalid routes
+- Invalid routes never enter received queue
+
+Rationale:
+- Clean separation of concerns
+- Zero overhead for non-ROV ASes
+- Models real RPKI validation behavior
+
+Trade-off:
++ Simple, efficient filtering
++ Easy to extend with additional validation
+- Invalid routes still forwarded by non-ROV ASes (realistic behavior)
+
+5.2 ROV DEPLOYMENT MODEL
+-------------------------
+Decision: Per-AS policy upgrade at initialization
+File: src/as_graph.cpp (lines 551-596)
+
+Process:
+1. Load ROV ASN list from file
+2. Replace BGP policy with ROV policy for listed ASes
+3. Track deployment count for statistics
+
+Rationale:
+- Models selective ROV deployment
+- Easy to experiment with deployment scenarios
+- Realistic: ROV adoption is gradual in real world
+
+================================================================================
+6. PERFORMANCE OPTIMIZATION DECISIONS
+================================================================================
+
+6.1 MEMORY PRE-ALLOCATION
+--------------------------
+Decision: Reserve hash map capacity upfront
+Files: src/as_graph.cpp (lines 10-12, 15-18)
+
+Reservations:
+- nodes: 120,000 entries
+- asn_set: 120,000 entries
+
+Rationale:
+- CAIDA graphs typically have ~78k ASes
+- Prevents rehashing during graph construction
+- Critical for reference_wrapper correctness (no invalidation)
+- ~20% margin for growth
+
+Impact: ~500KB upfront memory cost, eliminates rehashing cost.
+
+6.2 INLINE FUNCTIONS FOR HOT PATHS
+-----------------------------------
+Decision: Inline getNode() accessor
+File: include/as_graph.h (lines 96-104)
+
+Rationale:
+- getNode() called millions of times during propagation
+- Function call overhead ~1-5 cycles
+- Inlining reduces this to 0
+
+Trade-off: Slightly larger binary, but negligible for this use case.
+
+6.3 CACHE-FRIENDLY DATA LAYOUT
+-------------------------------
+Decision: Store neighbors as vectors, not individual pointers
+File: include/as_graph.h (lines 39-41)
+
+Rationale:
+- Vector elements stored contiguously in memory
+- Prefetcher can load multiple neighbors in single cache line
+- Reduces cache misses during neighbor iteration
+
+Impact: Estimated 20-30% speedup in propagation loops.
+
+================================================================================
+7. ERROR HANDLING DECISIONS
+================================================================================
+
+7.1 CYCLE DETECTION
+--------------------
+Decision: DFS-based cycle detection with recursion stack tracking
+File: src/as_graph.cpp (lines 141-218)
+
+Algorithm:
+- Separate DFS for provider and customer directions
+- Track visited set and recursion stack
+- Cycle detected if recursion stack contains neighbor
+
+Rationale:
+- BGP assumes DAG topology for provider-customer relationships
+- Cycles would cause infinite propagation
+- Must validate before simulation
+
+Complexity: O(V + E), runs once at startup.
+
+7.2 FILE I/O ERROR HANDLING
+----------------------------
+Decision: Boolean return values with stderr logging
+Files: Multiple (buildFromFile, loadROVASNs, exportToCSV)
+
+Rationale:
+- Simple error propagation to main()
+- Descriptive error messages to stderr
+- Non-zero exit codes indicate failure
+
+Alternative considered: Exceptions
+Rejected because: Boolean returns are sufficient for I/O errors, and
+exceptions add overhead in tight loops.
+
+================================================================================
+8. OUTPUT FORMAT DECISIONS
+================================================================================
+
+8.1 CSV FORMAT WITH TUPLE-STYLE PATHS
+--------------------------------------
+Decision: Format AS paths as Python-style tuples
+File: src/bgp_simulator_main.cpp (lines 136-148)
+
+Format: asn,prefix,"(as1, as2, as3)"
+Special case: Single element as "(as1,)"
+
+Rationale:
+- Compatible with Python parsing (ast.literal_eval)
+- Quoted to handle commas in path
+- Tuple format clearly distinguishes from array notation
+
+Trade-off:
++ Easy parsing in analysis scripts
+- Slightly verbose (2 extra chars per path)
+
+================================================================================
+9. TESTING DECISIONS
+================================================================================
+
+9.1 TEST SUITE STRUCTURE
+-------------------------
+Files:
+- tests/as_graph_test.cpp: Graph construction and cycle detection
+- src/bgp_rov_test.cpp: BGP propagation and ROV filtering
+- bench/compare_output.sh: Output validation
+
+Rationale:
+- Unit tests for core functionality
+- Integration test for full simulation
+- Benchmark tests for correctness at scale
+
+9.2 BENCHMARK SCENARIOS
+------------------------
+Three scenarios in bench/ directory:
+
+1. prefix: Single prefix hijack (2 announcements)
+   - Tests basic propagation and ROV filtering
+   - Fast execution (~600ms)
+
+2. subprefix: Sub-prefix hijack (2 announcements, different lengths)
+   - Tests prefix specificity handling
+   - Verifies both /16 and /24 propagate correctly
+
+3. many: Multiple prefixes (40 announcements)
+   - Tests scalability with ~3M total routes
+   - Realistic load test (~13.5s)
+
+Rationale: Cover common attack scenarios and scale testing.
+
+================================================================================
+10. DEPENDENCY DECISIONS
+================================================================================
+
+10.1 EXTERNAL LIBRARIES
+------------------------
+Decision: Minimal dependencies (C++17 standard library + CURL)
+File: CMakeLists.txt (line 15)
+
+Rationale:
+- Standard library sufficient for data structures
+- CURL only needed for CAIDA downloader (optional component)
+- Reduces build complexity and portability issues
+
+10.2 C++ STANDARD VERSION
+--------------------------
+Decision: C++17
+File: CMakeLists.txt (line 5)
+
+Features used:
+- std::reference_wrapper (C++11)
+- Structured bindings would help but not required
+- No C++20 features needed
+
+Rationale: C++17 widely supported, contains all needed features.
+
+================================================================================
+11. SCALABILITY CONSIDERATIONS
+================================================================================
+
+11.1 CURRENT SCALE
+------------------
+Tested with CAIDA AS graph:
+- 78,370 ASes
+- 489,407 relationships
+- Up to 3M announcements in RIBs
+- Peak memory: ~500MB
+- Execution time: <15 seconds
+
+11.2 SCALING LIMITS
+-------------------
+Theoretical limits:
+- ASN space: 32-bit (4 billion), but only ~100k active worldwide
+- Memory: O(V + E + P*V) where P = prefixes
+- Current bottleneck: AS path operations during propagation
+
+Potential optimizations for larger scale:
+- Parallel processing of independent ranks
+- Path compression (store shared path prefixes)
+- Incremental propagation (only changed routes)
+
+11.3 TIME COMPLEXITY ANALYSIS
+------------------------------
+Operation                    Complexity          Notes
+---------                    ----------          -----
+Graph construction           O(E)                Parse + insert relationships
+Cycle detection             O(V + E)            DFS traversal
+Graph flattening            O(V + E)            BFS ranking
+Propagation UP              O(V * P * d_out)    Per-rank processing
+Propagation ACROSS          O(V * P * peers)    All ASes simultaneously
+Propagation DOWN            O(V * P * d_out)    Per-rank processing
+Export to CSV               O(V * P)            Linear write
+
+Where: V = ASes, E = relationships, P = prefixes, d_out = average out-degree
+
+Total: O(V * P * d_out) dominated by propagation phases.
+
+================================================================================
+12. FUTURE EXTENSIBILITY
+================================================================================
+
+12.1 DESIGNED EXTENSION POINTS
+-------------------------------
+1. BGPPolicy virtual interface
+   - Easy to add new policies (e.g., BGPsec, ASPA)
+   - Override processReceivedQueue() for custom logic
+
+2. Announcement structure
+   - Can add fields (e.g., communities, MEDs) without breaking core logic
+   - Padding reserved for alignment
+
+3. Prefix types
+   - Union design allows adding new address families
+   - Would require extending parse() and toString()
+
+12.2 POTENTIAL ENHANCEMENTS
+----------------------------
+Not implemented but architecturally supported:
+
+1. Multi-path BGP
+   - Store vector of announcements per prefix instead of single best
+   - Modify processReceivedQueue() to maintain N best paths
+
+2. BGP communities
+   - Add communities field to Announcement
+   - Implement community-based filtering in policies
+
+3. Incremental updates
+   - Add withdrawal message type
+   - Implement negative caching in RIB
+
+4. Realistic timing
+   - Add timestamp to announcements
+   - Implement MRAI (Minimum Route Advertisement Interval)
+
+5. Partial deployment scenarios
+   - Framework exists (loadROVASNs pattern)
+   - Can add similar loaders for other security features
+
+================================================================================
+13. KNOWN LIMITATIONS
+================================================================================
+
+13.1 SIMPLIFICATIONS VS REAL BGP
+---------------------------------
+1. No BGP sessions/TCP connections (direct graph propagation)
+2. No MRAI timers (instant propagation)
+3. Simplified route selection (no MED, IGP cost, router ID)
+4. No BGP communities or extended attributes
+5. No route flap damping
+6. Deterministic propagation (no jitter)
+
+Rationale: Focus on route propagation patterns and security features
+rather than protocol-level details.
+
+13.2 VALIDATION CONSTRAINTS
+----------------------------
+1. Assumes DAG topology (detects and rejects cycles)
+2. Requires pre-computed topology (no dynamic discovery)
+3. No support for route withdrawals (announcement-only)
+4. Single propagation run (no convergence analysis)
+
+13.3 PERFORMANCE CONSTRAINTS
+-----------------------------
+1. Single-threaded execution
+2. In-memory graph (limited by RAM)
+3. No database backing (full load on each run)
+
+================================================================================
+14. DESIGN PRINCIPLES APPLIED
+================================================================================
+
+14.1 PERFORMANCE FIRST
+-----------------------
+- Cache-friendly data structures
+- Pre-allocation to avoid runtime overhead
+- Direct references to avoid lookups
+- Inline hot-path functions
+
+14.2 CORRECTNESS OVER FEATURES
+-------------------------------
+- Extensive validation (cycle detection)
+- Deterministic behavior (reproducible results)
+- Clear separation of concerns (policy vs propagation)
+
+14.3 SIMPLICITY WHERE POSSIBLE
+-------------------------------
+- Standard library over custom implementations
+- Boolean error returns over exceptions
+- Direct implementation over over-engineering
+
+14.4 REALISTIC MODELING
+-----------------------
+- Real-world topology data (CAIDA)
+- Valley-free routing enforcement
+- Economic relationship modeling
+- Selective security deployment (ROV)
+
+================================================================================
+END OF DESIGN DECISIONS DOCUMENT
+================================================================================
