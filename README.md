@@ -350,7 +350,7 @@ Performance on real-world CAIDA topology (78,370 ASes, 489,407 relationships):
 |-----------|---------------|-------------|------|------------|
 | Prefix | 2 | 78,022 | 579ms | 135k/sec |
 | Subprefix | 2 | 155,385 | 735ms | 211k/sec |
-| Many | 40 | 2,963,832 | 13.5s | 219k/sec |
+| Many | 40 | 2,963,832 | 13.5 - optimized down to 6s | 493k/sec |
 
 Tested on: Intel CPU, Linux 6.14, GCC 11.4, compiled with `-O3 -march=native`
 
@@ -467,4 +467,5 @@ for scenario in prefix subprefix many; do
     ./compare_output.sh $scenario/ribs.csv test_$scenario.csv
 done
 ```
+
 
